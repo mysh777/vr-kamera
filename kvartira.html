@@ -27,7 +27,7 @@
 <body>
 <div id="menu">
   <div style="font-size:28px;font-weight:bold">🏰 Квартира-замок</div>
-  <div style="color:#888">версия 5</div>
+  <div style="color:#888">версия 7</div>
   <div style="max-width:460px">Твоя квартира превратится в замок из блоков.<br>
   Сначала держи телефон <b>в руке</b> и отметь два угла на полу.<br>Потом вставь телефон в очки.</div>
   <button id="startAR">Старт (AR)</button>
@@ -231,24 +231,83 @@ eyeCam.matrixAutoUpdate = false;
 eyeCam.matrixWorldAutoUpdate = false;
 const headM = new THREE.Matrix4(), tmpM = new THREE.Matrix4();
 
+
+// ===== «Линзы» как в VR-приложениях: скруглённые окошки + бочка-искажение =====
+const eyeRT = new THREE.WebGLRenderTarget(16, 16);
+eyeRT.isXRRenderTarget = true;                 // хранит готовые цвета (sRGB)
+eyeRT.texture.colorSpace = THREE.SRGBColorSpace;
+const lensMat = new THREE.ShaderMaterial({
+  uniforms: { tex: { value: eyeRT.texture }, size: { value: new THREE.Vector2(1, 1) } },
+  vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }',
+  fragmentShader: `
+    uniform sampler2D tex; uniform vec2 size; varying vec2 vUv;
+    void main(){
+      vec2 p = vUv * 2.0 - 1.0;                       // -1..1 по окошку
+      float m = min(size.x, size.y);
+      vec2 q = p * size / m;                          // круглые единицы
+      float r2 = dot(q, q);
+      vec2 d = q * (1.0 + 0.22 * r2 + 0.10 * r2 * r2) * 0.72;   // бочка
+      vec2 uv = d * m / size * 0.5 + 0.5;
+      // скруглённая рамка окошка
+      vec2 a = abs(p) - vec2(0.62);
+      float box = length(max(a, 0.0)) - 0.34;
+      float edge = 1.0 - smoothstep(-0.03, 0.0, box);
+      if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) edge = 0.0;
+      gl_FragColor = vec4(texture2D(tex, uv).rgb * edge, 1.0);
+    }`,
+  depthTest: false, depthWrite: false
+});
+const lensScene = new THREE.Scene();
+const lensQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), lensMat);
+lensQuad.frustumCulled = false; lensScene.add(lensQuad);
+const lensCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
 function renderStereo(target, fbW, fbH) {
   if (target) { target.viewport.set(0, 0, fbW, fbH); target.scissor.set(0, 0, fbW, fbH); target.scissorTest = false; }
   renderer.setRenderTarget(target);
   if (!target) { renderer.setViewport(0, 0, fbW, fbH); renderer.setScissorTest(false); }
   renderer.setClearColor(0x000000, 1); renderer.clear();
-  const half = fbW / 2;
-  eyeCam.aspect = half / fbH; eyeCam.updateProjectionMatrix();
+
+  // Камера телефона уже сама поворачивается вместе с телефоном.
+  // Нужно только понять, где у человека «право», чтобы развести глаза
+  // и поделить экран: слева/справа или (если экран остался вертикальным) верх/низ.
+  const portrait = fbW < fbH;
+  const e = headM.elements;
+  const devX = new THREE.Vector3(e[0], e[1], e[2]), devY = new THREE.Vector3(e[4], e[5], e[6]);
+  const fwd = new THREE.Vector3(-e[8], -e[9], -e[10]);
+  const right = new THREE.Vector3().crossVectors(fwd, new THREE.Vector3(0, 1, 0));
+  if (right.lengthSq() < 1e-4) right.copy(devX); right.normalize();
+  const vw = portrait ? fbW : fbW / 2, vh = portrait ? fbH / 2 : fbH;
+  eyeCam.aspect = vw / vh; eyeCam.fov = portrait ? 2 * Math.atan(Math.tan(50 * Math.PI / 180) * vh / vw) * 180 / Math.PI : 100;
+  eyeCam.updateProjectionMatrix();
+  // в какую сторону экрана смотрит «право» человека
+  const rightAlong = portrait ? right.dot(devY) : right.dot(devX);
+  const headPos = new THREE.Vector3().setFromMatrixPosition(headM);
   for (let eye = 0; eye < 2; eye++) {
-    const off = (eye === 0 ? -1 : 1) * IPD / 2;
-    eyeCam.matrixWorld.copy(headM).multiply(tmpM.makeTranslation(off, 0, 0));
+    const isRight = eye === 1;
+    const p = headPos.clone().addScaledVector(right, (isRight ? 1 : -1) * IPD / 2);
+    eyeCam.matrixWorld.copy(headM).setPosition(p);
     eyeCam.matrixWorldInverse.copy(eyeCam.matrixWorld).invert();
+    const second = isRight === (rightAlong > 0); // правая/верхняя половина экрана
+    const x = portrait ? 0 : (second ? vw : 0);
+    const y = portrait ? (second ? vh : 0) : 0;
+    // 1) рисуем мир в отдельную картинку
+    const ew = Math.round(vw), eh = Math.round(vh);
+    if (eyeRT.width !== ew || eyeRT.height !== eh) eyeRT.setSize(ew, eh);
+    eyeRT.viewport.set(0, 0, ew, eh); eyeRT.scissorTest = false;
+    renderer.setRenderTarget(eyeRT);
+    renderer.setClearColor(0x87b8ff, 1); renderer.clear();
+    renderer.render(scene, eyeCam);
+    // 2) кладём её в окошко-линзу на экране
+    lensMat.uniforms.size.value.set(vw, vh);
     if (target) {
-      target.viewport.set(eye * half, 0, half, fbH); target.scissor.set(eye * half, 0, half, fbH); target.scissorTest = true;
+      target.viewport.set(x, y, vw, vh); target.scissor.set(x, y, vw, vh); target.scissorTest = true;
       renderer.setRenderTarget(target);
     } else {
-      renderer.setViewport(eye * half, 0, half, fbH); renderer.setScissor(eye * half, 0, half, fbH); renderer.setScissorTest(true);
+      renderer.setRenderTarget(null);
+      renderer.setViewport(x, y, vw, vh); renderer.setScissor(x, y, vw, vh); renderer.setScissorTest(true);
     }
-    renderer.render(scene, eyeCam);
+    renderer.render(lensScene, lensCam);
   }
 }
 
@@ -390,7 +449,7 @@ async function startAR() {
     if (frames % 15 === 0) {
       const p = pose.transform.position;
       document.getElementById('diag').textContent =
-        `v5 | кадр ${frames} | рисунков ${renderer.info.render.calls} | GL ${gl.getError()} | потерян ${gl.isContextLost()} | ` +
+        `v7 | кадр ${frames} | рисунков ${renderer.info.render.calls} | GL ${gl.getError()} | потерян ${gl.isContextLost()} | ` +
         `голова ${p.x.toFixed(1)},${p.y.toFixed(1)},${p.z.toFixed(1)} | мир ${world.position.x.toFixed(1)},${world.position.y.toFixed(1)},${world.position.z.toFixed(1)} | экран ${layer.framebufferWidth}x${layer.framebufferHeight}`;
     }
   });
