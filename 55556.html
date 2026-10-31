@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Квартира-замок VR</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: sans-serif; color: #fff; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #menu { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; text-align: center; padding: 20px; background: #111; z-index: 5; }
+  button { font-size: 20px; padding: 14px 26px; border: 0; border-radius: 14px; background: #3c3; color: #000; font-weight: bold; }
+  button.grey { background: #444; color: #fff; }
+  #err { color: #f66; max-width: 460px; }
+  #overlay { position: fixed; inset: 0; display: block; pointer-events: none; z-index: 10; }
+  #panel, #cross { display: none; }
+  .ar #panel, .ar #cross { display: block; }
+  #overlay * { pointer-events: auto; }
+  #cross { position: absolute; left: 50%; top: 50%; width: 60px; height: 60px; transform: translate(-50%, -50%); pointer-events: none; }
+  #cross::before, #cross::after { content: ""; position: absolute; background: #ff0; box-shadow: 0 0 3px #000; }
+  #cross::before { left: 29px; top: 0; width: 3px; height: 60px; }
+  #cross::after { top: 29px; left: 0; height: 3px; width: 60px; }
+  #panel { position: absolute; left: 50%; bottom: 20px; transform: translateX(-50%); background: rgba(0,0,0,.75); border-radius: 14px; padding: 12px 16px; text-align: center; max-width: 90%; }
+  #status { margin: 6px 0 10px; font-size: 16px; }
+  #hint { font-size: 14px; color: #ccc; }
+</style>
+</head>
+<body>
+<div id="menu">
+  <div style="font-size:28px;font-weight:bold">🏰 Квартира-замок</div>
+  <div style="color:#888">версия 7</div>
+  <div style="max-width:460px">Твоя квартира превратится в замок из блоков.<br>
+  Сначала держи телефон <b>в руке</b> и отметь два угла на полу.<br>Потом вставь телефон в очки.</div>
+  <button id="startAR">Старт (AR)</button>
+  <button id="startPreview" class="grey">Посмотреть без очков</button>
+  <div id="err"></div>
+</div>
+
+<div id="overlay">
+  <div id="dbg" style="position:fixed;left:0;right:0;top:0;z-index:99;background:rgba(150,0,0,.9);color:#fff;font-size:14px;padding:6px;display:none;white-space:pre-wrap"></div>
+
+  <div id="diag" style="position:absolute;left:8px;bottom:8px;font-size:13px;color:#ff0;text-shadow:0 0 3px #000;pointer-events:none"></div>
+  <div id="cross"></div>
+  <div id="panel">
+    <div id="step" style="font-weight:bold;font-size:18px"></div>
+    <div id="status">Ищу пол… медленно води телефоном</div>
+    <button id="mark">Отметить</button>
+    <div id="hint"></div>
+  </div>
+</div>
+
+<script>
+function showErr(m){const d=document.getElementById('dbg');d.style.display='block';d.textContent+='Ошибка: '+m+'\n';}
+addEventListener('error',e=>showErr(e.message+' (строка '+e.lineno+')'));
+addEventListener('unhandledrejection',e=>showErr(e.reason&&e.reason.message||e.reason));
+setTimeout(()=>{ if(!window.__ok) showErr('3D-библиотека не загрузилась. Проверь интернет и обнови страницу.'); }, 8000);
+</script>
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+window.__ok = true;
+
+// ================== ПЛАН КВАРТИРЫ ==================
+// Координаты сняты с плана (масштаб 1:100). 1 метр = 78.74 точки.
+const PX = 1 / 78.74;
+const H = 2.7;          // высота стен, м
+const T_IN = 0.12;      // толщина стен
+const T_OUT = 0.3;
+
+// [x1, y1, x2, y2, толщина]  (отрезки по осям)
+const WALLS = [
+  // наружная стена к террасе (с дверями на террасу)
+  [185,420, 495,420, T_OUT], [545,420, 860,420, T_OUT], [925,420, 1012,420, T_OUT],
+  // левая наружная стена (дверь на балкон)
+  [205,420, 205,1120, T_OUT], [205,1185, 205,1460, T_OUT],
+  // нижняя наружная
+  [205,1460, 632,1460, T_OUT],
+  // стена между гостиной и кухней/ванной
+  [617,420, 617,885, T_IN],
+  // гостиная снизу
+  [205,745, 525,745, T_IN],
+  // комната 065-4 (дверь справа)
+  [522,745, 522,765, T_IN], [522,850, 522,972, T_IN],
+  [205,972, 528,972, T_IN],
+  // комната 065-3 (дверь справа)
+  [528,972, 528,1030, T_IN], [528,1110, 528,1212, T_IN],
+  [205,1212, 528,1212, T_IN],
+  // комната 065-2 (дверь сверху)
+  [528,1135, 538,1135, T_IN], [608,1135, 632,1135, T_IN],
+  [632,1135, 632,1460, T_IN],
+  [615,968, 615,1135, T_IN],
+  // коридор: верх (дверь в ванную), низ
+  [617,885, 710,885, T_IN], [760,885, 870,885, T_IN],
+  [615,968, 1012,968, T_IN],
+  // правая стена (входная дверь)
+  [1012,420, 1012,860, T_OUT], [1012,935, 1012,968, T_OUT],
+  // ванная справа
+  [870,718, 870,885, T_IN],
+  // кухня снизу (дверь), туалет/ванная
+  [790,718, 875,718, T_IN], [950,718, 1012,718, T_IN],
+  [617,718, 790,718, T_IN],
+  // туалет
+  [617,550, 715,550, T_IN], [765,550, 790,550, T_IN],
+  [790,550, 790,718, T_IN],
+];
+
+// Низкие заборы на террасе и балконе
+const FENCES = [
+  [178,195, 178,420], [178,195, 650,195], [650,45, 650,195], [650,45, 885,45],
+  [885,45, 885,190], [885,190, 1145,190], [1145,190, 1145,408], [1012,408, 1145,408],
+  [42,950, 205,950], [42,950, 42,1188], [42,1188, 205,1188],
+];
+
+// Полы: [x1,y1,x2,y2, тип]
+const FLOORS = [
+  [205,420, 1012,968, 'planks'],
+  [205,968, 632,1460, 'planks'],
+  [178,195, 1145,420, 'grass'],
+  [650,45, 885,195, 'grass'],
+  [42,950, 205,1188, 'grass'],
+];
+
+// Точки калибровки (углы на полу)
+const CAL = [
+  { x: 1006, y: 962, name: 'Угол 1', hint: 'Угол в прихожей: справа от входной двери, внизу у пола (где правая стена встречается с дальней стеной коридора).' },
+  { x: 621, y: 974, name: 'Угол 2', hint: 'Угол, где коридор поворачивает к комнатам: выступающий угол стены у пола, в конце длинного коридора.' },
+];
+
+// ================== ТЕКСТУРЫ (свои, пиксельные) ==================
+function makeTex(seed, fn) {
+  const c = document.createElement('canvas'); c.width = c.height = 16;
+  const x = c.getContext('2d'); const im = x.createImageData(16, 16);
+  let s = seed;
+  const r = () => { s = (s * 16807) % 2147483647; return s / 2147483647; };
+  for (let py = 0; py < 16; py++) for (let px = 0; px < 16; px++) {
+    let [R, G, B] = fn(px, py, r);
+    if (px === 0 || py === 0 || px === 15 || py === 15) { R *= 0.8; G *= 0.8; B *= 0.8; }
+    const j = (py * 16 + px) * 4;
+    im.data[j] = R; im.data[j+1] = G; im.data[j+2] = B; im.data[j+3] = 255;
+  }
+  x.putImageData(im, 0, 0);
+  return c;
+}
+const IMG = {
+  stonebrick: makeTex(5, (x, y, r) => {
+    const row = Math.floor(y / 8), off = row % 2 ? 8 : 0;
+    if (y % 8 === 7 || (x + off) % 16 === 15) return [70, 70, 72];
+    const k = 0.8 + r() * 0.25; return [128 * k, 128 * k, 130 * k];
+  }),
+  planks: makeTex(44, (x, y, r) => {
+    let k = 0.85 + r() * 0.2;
+    if (y % 4 === 3) k *= 0.7;
+    if (x === ((Math.floor(y / 4) % 2) ? 4 : 12)) k *= 0.75;
+    return [170 * k, 133 * k, 80 * k];
+  }),
+  grass: makeTex(11, (x, y, r) => { const k = 0.75 + r() * 0.4; return [90 * k, 165 * k, 55 * k]; }),
+  log: makeTex(9, (x, y, r) => { const k = 0.8 + r() * 0.3 - (x % 4 === 0 ? 0.2 : 0); return [105 * k, 80 * k, 50 * k]; }),
+  torch: makeTex(3, (x, y, r) => y < 5 ? [255, 200 - y * 20, 60] : [110, 80, 45]),
+};
+function mat(name, rx, ry, extra = {}) {
+  const t = new THREE.CanvasTexture(IMG[name]);
+  t.magFilter = THREE.NearestFilter; t.minFilter = THREE.NearestFilter;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(rx, ry);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return new THREE.MeshLambertMaterial({ map: t, ...extra });
+}
+
+// ================== СЦЕНА ==================
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87b8ff);
+scene.fog = new THREE.Fog(0x87b8ff, 15, 60);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445533, 1.4));
+const sun = new THREE.DirectionalLight(0xfff2d0, 1.6); sun.position.set(5, 10, 3); scene.add(sun);
+
+const world = new THREE.Group();   // вся квартира — двигаем её при калибровке
+scene.add(world);
+const BLOCK = 0.5; // размер блока в метрах
+
+function addWall(x1, y1, x2, y2, t, h, matName) {
+  const len = Math.hypot(x2 - x1, y2 - y1) * PX + t;
+  const g = new THREE.BoxGeometry(len, h, t);
+  const m = mat(matName, len / BLOCK, h / BLOCK);
+  const mesh = new THREE.Mesh(g, m);
+  mesh.position.set((x1 + x2) / 2 * PX, h / 2, (y1 + y2) / 2 * PX);
+  if (x1 === x2) mesh.rotation.y = Math.PI / 2;
+  world.add(mesh);
+  return mesh;
+}
+for (const [x1, y1, x2, y2, t] of WALLS) addWall(x1, y1, x2, y2, t, H, 'stonebrick');
+for (const [x1, y1, x2, y2] of FENCES) addWall(x1, y1, x2, y2, 0.1, 1.0, 'log');
+for (const [x1, y1, x2, y2, type] of FLOORS) {
+  const w = (x2 - x1) * PX, d = (y2 - y1) * PX;
+  const f = new THREE.Mesh(new THREE.PlaneGeometry(w, d), mat(type, w / BLOCK, d / BLOCK));
+  f.rotation.x = -Math.PI / 2;
+  f.position.set((x1 + x2) / 2 * PX, 0.001, (y1 + y2) / 2 * PX);
+  world.add(f);
+}
+// Земля вокруг (трава далеко внизу не нужна — просто большое поле)
+{
+  const g = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), mat('grass', 400, 400));
+  g.rotation.x = -Math.PI / 2; g.position.set(8, -0.02, 10); world.add(g);
+}
+// Факелы на стенах
+const torchMat = mat('torch', 1, 1, { emissive: 0xffaa33, emissiveIntensity: 0.6 });
+const torches = [[400, 430], [205 + 10, 600], [205 + 10, 860], [205 + 10, 1100], [205 + 10, 1330], [800, 958], [1002, 600], [620, 1050]];
+for (const [x, y] of torches) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.4, 0.08), torchMat);
+  m.position.set(x * PX, 1.8, y * PX); world.add(m);
+}
+// Деревья снаружи за террасой
+function tree(x, z) {
+  const trunk = new THREE.Mesh(new THREE.BoxGeometry(0.5, 3, 0.5), mat('log', 1, 6));
+  trunk.position.set(x, 1.5, z); world.add(trunk);
+  const leaves = new THREE.Mesh(new THREE.BoxGeometry(2.5, 2, 2.5), new THREE.MeshLambertMaterial({ color: 0x3f8f2f }));
+  leaves.position.set(x, 3.6, z); world.add(leaves);
+}
+tree(-3, -2); tree(4, -4); tree(17, -1); tree(-4, 8); tree(-5, 16);
+
+// ================== РЕНДЕР ==================
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(2, devicePixelRatio));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+renderer.domElement.style.display = 'none';
+renderer.autoClear = false;
+
+const IPD = 0.064;
+const eyeCam = new THREE.PerspectiveCamera(80, 1, 0.05, 200);
+eyeCam.matrixAutoUpdate = false;
+eyeCam.matrixWorldAutoUpdate = false;
+const headM = new THREE.Matrix4(), tmpM = new THREE.Matrix4();
+
+
+// ===== «Линзы» как в VR-приложениях: скруглённые окошки + бочка-искажение =====
+const eyeRT = new THREE.WebGLRenderTarget(16, 16);
+eyeRT.isXRRenderTarget = true;                 // хранит готовые цвета (sRGB)
+eyeRT.texture.colorSpace = THREE.SRGBColorSpace;
+const lensMat = new THREE.ShaderMaterial({
+  uniforms: { tex: { value: eyeRT.texture }, size: { value: new THREE.Vector2(1, 1) } },
+  vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }',
+  fragmentShader: `
+    uniform sampler2D tex; uniform vec2 size; varying vec2 vUv;
+    void main(){
+      vec2 p = vUv * 2.0 - 1.0;                       // -1..1 по окошку
+      float m = min(size.x, size.y);
+      vec2 q = p * size / m;                          // круглые единицы
+      float r2 = dot(q, q);
+      vec2 d = q * (1.0 + 0.22 * r2 + 0.10 * r2 * r2) * 0.72;   // бочка
+      vec2 uv = d * m / size * 0.5 + 0.5;
+      // скруглённая рамка окошка
+      vec2 a = abs(p) - vec2(0.62);
+      float box = length(max(a, 0.0)) - 0.34;
+      float edge = 1.0 - smoothstep(-0.03, 0.0, box);
+      if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) edge = 0.0;
+      gl_FragColor = vec4(texture2D(tex, uv).rgb * edge, 1.0);
+    }`,
+  depthTest: false, depthWrite: false
+});
+const lensScene = new THREE.Scene();
+const lensQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), lensMat);
+lensQuad.frustumCulled = false; lensScene.add(lensQuad);
+const lensCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+function renderStereo(target, fbW, fbH) {
+  if (target) { target.viewport.set(0, 0, fbW, fbH); target.scissor.set(0, 0, fbW, fbH); target.scissorTest = false; }
+  renderer.setRenderTarget(target);
+  if (!target) { renderer.setViewport(0, 0, fbW, fbH); renderer.setScissorTest(false); }
+  renderer.setClearColor(0x000000, 1); renderer.clear();
+
+  // Камера телефона уже сама поворачивается вместе с телефоном.
+  // Нужно только понять, где у человека «право», чтобы развести глаза
+  // и поделить экран: слева/справа или (если экран остался вертикальным) верх/низ.
+  const portrait = fbW < fbH;
+  const e = headM.elements;
+  const devX = new THREE.Vector3(e[0], e[1], e[2]), devY = new THREE.Vector3(e[4], e[5], e[6]);
+  const fwd = new THREE.Vector3(-e[8], -e[9], -e[10]);
+  const right = new THREE.Vector3().crossVectors(fwd, new THREE.Vector3(0, 1, 0));
+  if (right.lengthSq() < 1e-4) right.copy(devX); right.normalize();
+  const vw = portrait ? fbW : fbW / 2, vh = portrait ? fbH / 2 : fbH;
+  eyeCam.aspect = vw / vh; eyeCam.fov = portrait ? 2 * Math.atan(Math.tan(50 * Math.PI / 180) * vh / vw) * 180 / Math.PI : 100;
+  eyeCam.updateProjectionMatrix();
+  // в какую сторону экрана смотрит «право» человека
+  const rightAlong = portrait ? right.dot(devY) : right.dot(devX);
+  const headPos = new THREE.Vector3().setFromMatrixPosition(headM);
+  for (let eye = 0; eye < 2; eye++) {
+    const isRight = eye === 1;
+    const p = headPos.clone().addScaledVector(right, (isRight ? 1 : -1) * IPD / 2);
+    eyeCam.matrixWorld.copy(headM).setPosition(p);
+    eyeCam.matrixWorldInverse.copy(eyeCam.matrixWorld).invert();
+    const second = isRight === (rightAlong > 0); // правая/верхняя половина экрана
+    const x = portrait ? 0 : (second ? vw : 0);
+    const y = portrait ? (second ? vh : 0) : 0;
+    // 1) рисуем мир в отдельную картинку
+    const ew = Math.round(vw), eh = Math.round(vh);
+    if (eyeRT.width !== ew || eyeRT.height !== eh) eyeRT.setSize(ew, eh);
+    eyeRT.viewport.set(0, 0, ew, eh); eyeRT.scissorTest = false;
+    renderer.setRenderTarget(eyeRT);
+    renderer.setClearColor(0x87b8ff, 1); renderer.clear();
+    renderer.render(scene, eyeCam);
+    // 2) кладём её в окошко-линзу на экране
+    lensMat.uniforms.size.value.set(vw, vh);
+    if (target) {
+      target.viewport.set(x, y, vw, vh); target.scissor.set(x, y, vw, vh); target.scissorTest = true;
+      renderer.setRenderTarget(target);
+    } else {
+      renderer.setRenderTarget(null);
+      renderer.setViewport(x, y, vw, vh); renderer.setScissor(x, y, vw, vh); renderer.setScissorTest(true);
+    }
+    renderer.render(lensScene, lensCam);
+  }
+}
+
+// ================== РЕЖИМ БЕЗ ОЧКОВ (на компьютере) ==================
+let previewPos = new THREE.Vector3(820 * PX, 1.6, 930 * PX), yaw = Math.PI / 2, pitch = 0;
+const keys = {};
+function startPreview() {
+  document.getElementById('menu').style.display = 'none';
+  renderer.domElement.style.display = 'block';
+  addEventListener('keydown', e => keys[e.key.toLowerCase()] = true);
+  addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+  let drag = null;
+  addEventListener('pointerdown', e => drag = [e.clientX, e.clientY]);
+  addEventListener('pointerup', () => drag = null);
+  addEventListener('pointermove', e => {
+    if (!drag) return;
+    yaw -= (e.clientX - drag[0]) * 0.005; pitch -= (e.clientY - drag[1]) * 0.005;
+    pitch = Math.max(-1.2, Math.min(1.2, pitch)); drag = [e.clientX, e.clientY];
+  });
+  addEventListener('resize', () => renderer.setSize(innerWidth, innerHeight));
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(0.1, (now - last) / 1000); last = now;
+    const fwd = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw)), right = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+    const sp = 1.5 * dt;
+    if (keys['w'] || keys['arrowup'] || keys['ц']) previewPos.addScaledVector(fwd, sp);
+    if (keys['s'] || keys['arrowdown'] || keys['ы']) previewPos.addScaledVector(fwd, -sp);
+    if (keys['a'] || keys['ф']) previewPos.addScaledVector(right, -sp);
+    if (keys['d'] || keys['в']) previewPos.addScaledVector(right, sp);
+    if (keys['arrowleft']) yaw += 1.5 * dt;
+    if (keys['arrowright']) yaw -= 1.5 * dt;
+    headM.compose(previewPos, new THREE.Quaternion().setFromEuler(new THREE.Euler(pitch, yaw, 0, 'YXZ')), new THREE.Vector3(1, 1, 1));
+    renderStereo(null, innerWidth, innerHeight);
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+}
+window.__test = { THREE, renderer, renderStereo, headM, world };
+window.__preview = (x, z, y) => { previewPos.set(x, 1.6, z); yaw = y; };
+
+// ================== AR РЕЖИМ (телефон + очки) ==================
+async function startAR() {
+  const err = document.getElementById('err');
+  if (!navigator.xr || !(await navigator.xr.isSessionSupported('immersive-ar').catch(() => false))) {
+    err.textContent = 'Этот браузер не поддерживает AR. Открой страницу в Chrome на телефоне и проверь, что установлены «Сервисы Google Play для AR».';
+    return;
+  }
+  const overlay = document.getElementById('overlay');
+  let session;
+  try {
+    session = await navigator.xr.requestSession('immersive-ar', {
+      requiredFeatures: ['hit-test', 'local'],
+      optionalFeatures: ['dom-overlay'],
+      domOverlay: { root: overlay }
+    });
+  } catch (e) { err.textContent = 'Не удалось включить AR: ' + e.message; return; }
+
+  overlay.classList.add('ar');
+  document.getElementById('menu').style.display = 'none';
+  if (!session.domOverlayState) showErr('Кнопки поверх камеры не поддерживаются в этом браузере');
+  const gl = renderer.getContext();
+  await gl.makeXRCompatible();
+  const layer = new XRWebGLLayer(session, gl);
+  session.updateRenderState({ baseLayer: layer });
+  const local = await session.requestReferenceSpace('local');
+  const viewer = await session.requestReferenceSpace('viewer');
+  const hitSrc = await session.requestHitTestSource({ space: viewer });
+  const target = new THREE.WebGLRenderTarget(layer.framebufferWidth, layer.framebufferHeight);
+  target.isXRRenderTarget = true;               // чтобы цвета были правильные
+  target.texture.colorSpace = THREE.SRGBColorSpace;
+  renderer.setRenderTargetFramebuffer(target, layer.framebuffer);
+
+  // Калибровка
+  const real = [];
+  let lastHit = null, mode = 'cal', countdown = 0;
+  const stepEl = document.getElementById('step'), statusEl = document.getElementById('status'), hintEl = document.getElementById('hint');
+  function showStep() {
+    const c = CAL[real.length];
+    stepEl.textContent = `${c.name} из 2: наведи жёлтый крестик на угол у пола`;
+    hintEl.textContent = c.hint;
+  }
+  showStep();
+  document.getElementById('mark').onclick = () => {
+    if (!lastHit) { statusEl.textContent = 'Пол ещё не найден — поводи телефоном'; return; }
+    real.push(lastHit.clone());
+    if (real.length < 2) { showStep(); return; }
+    placeWorld();
+    mode = 'count'; countdown = 6;
+    document.getElementById('mark').style.display = 'none';
+    hintEl.textContent = '';
+    stepEl.textContent = 'Готово! Вставляй телефон в очки';
+  };
+  let floorY = 0;
+  function placeWorld() {
+    floorY = (real[0].y + real[1].y) / 2;
+    const A = { x: CAL[0].x * PX, z: CAL[0].y * PX }, B = { x: CAL[1].x * PX, z: CAL[1].y * PX };
+    const aPlan = Math.atan2(B.z - A.z, B.x - A.x);
+    const aReal = Math.atan2(real[1].z - real[0].z, real[1].x - real[0].x);
+    const th = aReal - aPlan, c = Math.cos(th), s = Math.sin(th);
+    world.rotation.y = -th;
+    world.position.set(real[0].x - (c * A.x - s * A.z), floorY, real[0].z - (s * A.x + c * A.z));
+    // показываем разницу длины (для проверки точности)
+    const dPlan = Math.hypot(B.x - A.x, B.z - A.z), dReal = Math.hypot(real[1].x - real[0].x, real[1].z - real[0].z);
+    statusEl.textContent = `Разница с планом: ${Math.round(Math.abs(dReal - dPlan) * 100)} см`;
+  }
+
+  let lastT = 0, frames = 0;
+  setInterval(() => { const st = document.getElementById('status'); if (mode === 'cal' && frames === 0) st.textContent = 'AR не присылает кадры… (0 кадров)'; }, 3000);
+  session.requestAnimationFrame(function onFrame(t, frame) {
+    session.requestAnimationFrame(onFrame);
+    const dt = lastT ? (t - lastT) / 1000 : 0; lastT = t;
+    const pose = frame.getViewerPose(local);
+    frames++; if (frames % 30 === 0) document.getElementById('hint').dataset.f = frames;
+    if (mode === 'cal') {
+      const hits = frame.getHitTestResults(hitSrc);
+      if (hits.length) {
+        const p = hits[0].getPose(local).transform.position;
+        lastHit = new THREE.Vector3(p.x, p.y, p.z);
+        statusEl.textContent = '✅ Пол найден';
+      } else { lastHit = null; statusEl.textContent = 'Ищу пол… медленно води телефоном'; }
+      // прозрачный кадр — видна камера
+      target.viewport.set(0, 0, layer.framebufferWidth, layer.framebufferHeight); target.scissorTest = false;
+      renderer.setRenderTarget(target);
+      renderer.setClearColor(0x000000, 0); renderer.clear();
+      return;
+    }
+    if (mode === 'count') {
+      countdown -= dt;
+      statusEl.textContent = `Мир появится через ${Math.max(0, Math.ceil(countdown))}…`;
+      if (countdown <= 0) { mode = 'world'; overlay.classList.remove('ar'); } // корень оверлея не прячем, иначе экран чёрный
+      target.viewport.set(0, 0, layer.framebufferWidth, layer.framebufferHeight); target.scissorTest = false;
+      renderer.setRenderTarget(target); renderer.setClearColor(0x000000, 0); renderer.clear();
+      return;
+    }
+    if (!pose) return;
+    headM.fromArray(pose.transform.matrix);
+    renderer.info.autoReset = false; renderer.info.reset();
+    renderStereo(target, layer.framebufferWidth, layer.framebufferHeight);
+    if (frames % 15 === 0) {
+      const p = pose.transform.position;
+      document.getElementById('diag').textContent =
+        `v7 | кадр ${frames} | рисунков ${renderer.info.render.calls} | GL ${gl.getError()} | потерян ${gl.isContextLost()} | ` +
+        `голова ${p.x.toFixed(1)},${p.y.toFixed(1)},${p.z.toFixed(1)} | мир ${world.position.x.toFixed(1)},${world.position.y.toFixed(1)},${world.position.z.toFixed(1)} | экран ${layer.framebufferWidth}x${layer.framebufferHeight}`;
+    }
+  });
+  session.addEventListener('end', () => location.reload());
+}
+
+document.getElementById('startAR').onclick = startAR;
+document.getElementById('startPreview').onclick = startPreview;
+</script>
+</body>
+</html>
