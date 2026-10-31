@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>VR камера</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: sans-serif; color: #fff; }
+  #view { position: fixed; inset: 0; display: none; }
+  .eye { position: absolute; top: 0; width: 50%; height: 100%; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+  .eye.left { left: 0; }
+  .eye.right { right: 0; }
+  .eye video { width: var(--size, 90%); height: var(--size, 90%); object-fit: cover; border-radius: 12px; }
+  #divider { position: absolute; left: 50%; top: 0; width: 2px; height: 100%; background: #222; transform: translateX(-1px); }
+  #start { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; text-align: center; padding: 20px; }
+  button { font-size: 22px; padding: 16px 32px; border: 0; border-radius: 14px; background: #3c3; color: #000; font-weight: bold; }
+  #settings { position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,.75); padding: 10px 16px; border-radius: 12px; display: none; gap: 10px; align-items: center; font-size: 16px; }
+  #settings button { font-size: 16px; padding: 8px 14px; }
+  #err { color: #f66; max-width: 420px; }
+</style>
+</head>
+<body>
+<div id="start">
+  <div style="font-size:28px;font-weight:bold">VR камера 👓</div>
+  <div>Поверни телефон горизонтально и нажми кнопку.<br>Потом вставь телефон в очки.</div>
+  <button id="go">Старт</button>
+  <div id="err"></div>
+</div>
+
+<div id="view">
+  <div class="eye left"><video id="v1" autoplay playsinline muted></video></div>
+  <div class="eye right"><video id="v2" autoplay playsinline muted></video></div>
+  <div id="divider"></div>
+</div>
+
+<div id="settings">
+  Размер:
+  <button id="minus">−</button>
+  <button id="plus">+</button>
+  <button id="hide">OK</button>
+</div>
+
+<script>
+  const v1 = document.getElementById('v1');
+  const v2 = document.getElementById('v2');
+  const view = document.getElementById('view');
+  const settings = document.getElementById('settings');
+  let size = 90;
+  try { size = Number(localStorage.getItem('vrSize')) || 90; } catch (e) {}
+
+  function applySize() {
+    view.style.setProperty('--size', size + '%');
+    try { localStorage.setItem('vrSize', size); } catch (e) {}
+  }
+
+  document.getElementById('go').onclick = async () => {
+    const err = document.getElementById('err');
+    err.textContent = '';
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false
+      });
+      v1.srcObject = stream;
+      v2.srcObject = stream;
+      document.getElementById('start').style.display = 'none';
+      view.style.display = 'block';
+      applySize();
+      try { await document.documentElement.requestFullscreen(); } catch (e) {}
+      try { await screen.orientation.lock('landscape'); } catch (e) {}
+      try { await navigator.wakeLock.request('screen'); } catch (e) {}
+    } catch (e) {
+      err.textContent = 'Не получилось включить камеру. Разреши доступ к камере в браузере и попробуй снова. (' + e.name + ')';
+    }
+  };
+
+  // Нажми на экран — появятся настройки размера
+  view.onclick = () => { settings.style.display = 'flex'; };
+  document.getElementById('plus').onclick = () => { size = Math.min(100, size + 5); applySize(); };
+  document.getElementById('minus').onclick = () => { size = Math.max(50, size - 5); applySize(); };
+  document.getElementById('hide').onclick = () => { settings.style.display = 'none'; };
+</script>
+</body>
+</html>
