@@ -32,6 +32,7 @@
   <div id="err"></div>
 </div>
 
+<div id="dbg" style="position:fixed;left:0;right:0;top:0;z-index:99;background:rgba(150,0,0,.9);color:#fff;font-size:14px;padding:6px;display:none;white-space:pre-wrap"></div>
 <div id="overlay">
   <div id="cross"></div>
   <div id="panel">
@@ -42,11 +43,18 @@
   </div>
 </div>
 
+<script>
+function showErr(m){const d=document.getElementById('dbg');d.style.display='block';d.textContent+='Ошибка: '+m+'\n';}
+addEventListener('error',e=>showErr(e.message+' (строка '+e.lineno+')'));
+addEventListener('unhandledrejection',e=>showErr(e.reason&&e.reason.message||e.reason));
+setTimeout(()=>{ if(!window.__ok) showErr('3D-библиотека не загрузилась. Проверь интернет и обнови страницу.'); }, 8000);
+</script>
 <script type="importmap">
 { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
 </script>
 <script type="module">
 import * as THREE from 'three';
+window.__ok = true;
 
 // ================== ПЛАН КВАРТИРЫ ==================
 // Координаты сняты с плана (масштаб 1:100). 1 метр = 78.74 точки.
@@ -294,6 +302,7 @@ async function startAR() {
 
   overlay.style.display = 'block';
   document.getElementById('menu').style.display = 'none';
+  if (!session.domOverlayState) showErr('Кнопки поверх камеры не поддерживаются в этом браузере');
   const gl = renderer.getContext();
   await gl.makeXRCompatible();
   const layer = new XRWebGLLayer(session, gl);
