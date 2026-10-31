@@ -22,12 +22,14 @@
   #panel { position: absolute; left: 50%; bottom: 20px; transform: translateX(-50%); background: rgba(0,0,0,.75); border-radius: 14px; padding: 12px 16px; text-align: center; max-width: 90%; }
   #status { margin: 6px 0 10px; font-size: 16px; }
   #hint { font-size: 14px; color: #ccc; }
+  .row2 { display: flex; gap: 8px; justify-content: center; margin: 6px 0; }
+  .row2 button { font-size: 20px; padding: 10px 16px; min-width: 56px; }
 </style>
 </head>
 <body>
 <div id="menu">
   <div style="font-size:28px;font-weight:bold">🏰 Квартира-замок</div>
-  <div style="color:#888">версия 7</div>
+  <div style="color:#888">версия 8</div>
   <div style="max-width:460px">Твоя квартира превратится в замок из блоков.<br>
   Сначала держи телефон <b>в руке</b> и отметь два угла на полу.<br>Потом вставь телефон в очки.</div>
   <button id="startAR">Старт (AR)</button>
@@ -44,6 +46,11 @@
     <div id="step" style="font-weight:bold;font-size:18px"></div>
     <div id="status">Ищу пол… медленно води телефоном</div>
     <button id="mark">Отметить</button>
+    <div id="adjust" style="display:none">
+      <div class="row2"><button id="rL">⟲</button><button id="aF">▲</button><button id="rR">⟳</button></div>
+      <div class="row2"><button id="aL">◀</button><button id="aB">▼</button><button id="aR">▶</button></div>
+      <div class="row2"><button id="aRedo" class="grey">Заново</button><button id="aOK">Готово</button></div>
+    </div>
     <div id="hint"></div>
   </div>
 </div>
@@ -188,6 +195,17 @@ function addWall(x1, y1, x2, y2, t, h, matName) {
   return mesh;
 }
 for (const [x1, y1, x2, y2, t] of WALLS) addWall(x1, y1, x2, y2, t, H, 'stonebrick');
+// Зелёные контуры стен — для проверки калибровки
+const outlineMat = new THREE.LineBasicMaterial({ color: 0x00ff66 });
+for (const [x1, y1, x2, y2, t] of WALLS) {
+  const len = Math.hypot(x2 - x1, y2 - y1) * PX + t;
+  const e = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(len, H, t)), outlineMat);
+  e.position.set((x1 + x2) / 2 * PX, H / 2, (y1 + y2) / 2 * PX);
+  if (x1 === x2) e.rotation.y = Math.PI / 2;
+  e.userData.outline = true; e.visible = false; world.add(e);
+}
+const outlineCam = new THREE.PerspectiveCamera();
+outlineCam.matrixAutoUpdate = false; outlineCam.matrixWorldAutoUpdate = false;
 for (const [x1, y1, x2, y2] of FENCES) addWall(x1, y1, x2, y2, 0.1, 1.0, 'log');
 for (const [x1, y1, x2, y2, type] of FLOORS) {
   const w = (x2 - x1) * PX, d = (y2 - y1) * PX;
@@ -360,7 +378,7 @@ async function startAR() {
   try {
     session = await navigator.xr.requestSession('immersive-ar', {
       requiredFeatures: ['hit-test', 'local'],
-      optionalFeatures: ['dom-overlay'],
+      optionalFeatures: ['dom-overlay', 'anchors'],
       domOverlay: { root: overlay }
     });
   } catch (e) { err.textContent = 'Не удалось включить AR: ' + e.message; return; }
@@ -380,60 +398,157 @@ async function startAR() {
   target.texture.colorSpace = THREE.SRGBColorSpace;
   renderer.setRenderTargetFramebuffer(target, layer.framebuffer);
 
-  // Калибровка
-  const real = [];
-  let lastHit = null, mode = 'cal', countdown = 0;
+  // ===== Калибровка =====
+  // real[i]   — где угол на самом деле (по камере)
+  // anchors[i]— «якорь» ARCore: если телефон поправит карту, угол поедет вместе с ней
+  const real = [], anchors = [], anchorDelta = [];
+  const hitBuf = [];                    // последние точки — усредняем для точности
+  let lastHitResult = null, mode = 'cal', countdown = 0;
+  const adj = { dx: 0, dz: 0, rot: 0 }; // ручная подстройка
   const stepEl = document.getElementById('step'), statusEl = document.getElementById('status'), hintEl = document.getElementById('hint');
+  const markBtn = document.getElementById('mark'), adjPanel = document.getElementById('adjust');
   function showStep() {
     const c = CAL[real.length];
     stepEl.textContent = `${c.name} из 2: наведи жёлтый крестик на угол у пола`;
-    hintEl.textContent = c.hint;
+    hintEl.textContent = c.hint + ' Держи телефон неподвижно 1 секунду и нажми.';
   }
   showStep();
-  document.getElementById('mark').onclick = () => {
-    if (!lastHit) { statusEl.textContent = 'Пол ещё не найден — поводи телефоном'; return; }
-    real.push(lastHit.clone());
+  // Нажатие «Отметить» запоминаем, а сам угол ставим внутри кадра AR (так требует браузер)
+  let wantMark = false;
+  markBtn.onclick = () => { wantMark = true; };
+  function doMark(hit) {
+    wantMark = false;
+    if (hitBuf.length < 5) { hintEl.textContent = '⚠ Пол ещё не найден — поводи телефоном'; return; }
+    const avg = new THREE.Vector3();
+    for (const h of hitBuf) avg.add(h); avg.divideScalar(hitBuf.length);
+    const spread = Math.max(...hitBuf.map(h => h.distanceTo(avg)));
+    if (spread > 0.05) { hintEl.textContent = `⚠ Крестик дрожит (${Math.round(spread * 100)} см) — держи ровнее`; return; }
+    const i = real.length;
+    real.push(avg.clone());
+    anchors[i] = null;
+    try {
+      if (hit.createAnchor) {
+        const hp = hit.getPose(local).transform.position;
+        anchorDelta[i] = new THREE.Vector3(avg.x - hp.x, avg.y - hp.y, avg.z - hp.z);
+        hit.createAnchor().then(a => { anchors[i] = a; }).catch(() => {});
+      }
+    } catch (e) { anchors[i] = null; }
+    hitBuf.length = 0;
     if (real.length < 2) { showStep(); return; }
     placeWorld();
+    mode = 'adjust';
+    markBtn.style.display = 'none';
+    adjPanel.style.display = 'block';
+    stepEl.textContent = 'Проверь: зелёные линии должны лечь на настоящие стены';
+    hintEl.textContent = 'Если съехало — двигай стрелками (2 см) и ⟲⟳ (0,5°). Потом «Готово».';
+  }
+
+  // Ручная подстройка (стрелки двигают модель относительно того, куда смотришь)
+  let lastPose = null;
+  function nudge(fx, fz) {
+    if (!lastPose) return;
+    const m = lastPose.transform.matrix;
+    const fwd = new THREE.Vector3(-m[8], 0, -m[10]).normalize();
+    const right = new THREE.Vector3(-fwd.z, 0, fwd.x);
+    const step = 0.02; // 2 см
+    adj.dx += (right.x * fx + fwd.x * fz) * step;
+    adj.dz += (right.z * fx + fwd.z * fz) * step;
+    placeWorld();
+  }
+  const on = (id, f) => document.getElementById(id).onclick = f;
+  on('aL', () => nudge(-1, 0)); on('aR', () => nudge(1, 0));
+  on('aF', () => nudge(0, 1));  on('aB', () => nudge(0, -1));
+  on('rL', () => { adj.rot += 0.5 * Math.PI / 180; placeWorld(); });
+  on('rR', () => { adj.rot -= 0.5 * Math.PI / 180; placeWorld(); });
+  on('aOK', () => {
+    adjPanel.style.display = 'none';
     mode = 'count'; countdown = 6;
-    document.getElementById('mark').style.display = 'none';
     hintEl.textContent = '';
-    stepEl.textContent = 'Готово! Вставляй телефон в очки';
-  };
+    stepEl.textContent = 'Готово! Поверни телефон горизонтально и вставляй в очки';
+  });
+  on('aRedo', () => {
+    real.length = 0; anchors.length = 0; hitBuf.length = 0; adj.dx = adj.dz = adj.rot = 0;
+    adjPanel.style.display = 'none'; markBtn.style.display = ''; mode = 'cal'; showStep();
+  });
+
   let floorY = 0;
   function placeWorld() {
-    floorY = (real[0].y + real[1].y) / 2;
+    // точки с подстройкой: сдвиг + поворот вокруг середины
+    const mid = new THREE.Vector3().addVectors(real[0], real[1]).multiplyScalar(0.5);
+    const cr = Math.cos(adj.rot), sr = Math.sin(adj.rot);
+    const R = real.map(p => {
+      const dx = p.x - mid.x, dz = p.z - mid.z;
+      return { x: mid.x + cr * dx - sr * dz + adj.dx, y: p.y, z: mid.z + sr * dx + cr * dz + adj.dz };
+    });
+    floorY = (R[0].y + R[1].y) / 2;
     const A = { x: CAL[0].x * PX, z: CAL[0].y * PX }, B = { x: CAL[1].x * PX, z: CAL[1].y * PX };
     const aPlan = Math.atan2(B.z - A.z, B.x - A.x);
-    const aReal = Math.atan2(real[1].z - real[0].z, real[1].x - real[0].x);
+    const aReal = Math.atan2(R[1].z - R[0].z, R[1].x - R[0].x);
     const th = aReal - aPlan, c = Math.cos(th), s = Math.sin(th);
+    // ставим модель так, чтобы середина отрезка совпала (ошибка делится пополам)
+    const Am = { x: (A.x + B.x) / 2, z: (A.z + B.z) / 2 }, Rm = { x: (R[0].x + R[1].x) / 2, z: (R[0].z + R[1].z) / 2 };
     world.rotation.y = -th;
-    world.position.set(real[0].x - (c * A.x - s * A.z), floorY, real[0].z - (s * A.x + c * A.z));
-    // показываем разницу длины (для проверки точности)
-    const dPlan = Math.hypot(B.x - A.x, B.z - A.z), dReal = Math.hypot(real[1].x - real[0].x, real[1].z - real[0].z);
-    statusEl.textContent = `Разница с планом: ${Math.round(Math.abs(dReal - dPlan) * 100)} см`;
+    world.position.set(Rm.x - (c * Am.x - s * Am.z), floorY, Rm.z - (s * Am.x + c * Am.z));
+    const dPlan = Math.hypot(B.x - A.x, B.z - A.z), dReal = Math.hypot(R[1].x - R[0].x, R[1].z - R[0].z);
+    statusEl.textContent = `Разница с планом: ${Math.round(Math.abs(dReal - dPlan) * 100)} см` + (anchors[0] ? ' · якоря ✓' : '');
+  }
+
+  // Каждый кадр: если ARCore поправил карту — двигаем углы вместе с якорями
+  function followAnchors(frame) {
+    let changed = false;
+    for (let i = 0; i < real.length; i++) {
+      const an = anchors[i];
+      if (!an || !frame.trackedAnchors || !frame.trackedAnchors.has(an)) continue;
+      const ap = frame.getPose(an.anchorSpace, local);
+      if (!ap) continue;
+      const p = ap.transform.position, d = anchorDelta[i];
+      const np = new THREE.Vector3(p.x + d.x, p.y + d.y, p.z + d.z);
+      if (np.distanceTo(real[i]) > 0.002) { real[i].copy(np); changed = true; }
+    }
+    if (changed) placeWorld();
+  }
+
+  // Режим проверки: поверх камеры рисуем только зелёные контуры стен
+  function renderOutline(pose) {
+    const view = pose.views[0], vp = layer.getViewport(view);
+    target.viewport.set(0, 0, layer.framebufferWidth, layer.framebufferHeight); target.scissorTest = false;
+    renderer.setRenderTarget(target); renderer.setClearColor(0x000000, 0); renderer.clear();
+    target.viewport.set(vp.x, vp.y, vp.width, vp.height); renderer.setRenderTarget(target);
+    outlineCam.projectionMatrix.fromArray(view.projectionMatrix);
+    outlineCam.projectionMatrixInverse.copy(outlineCam.projectionMatrix).invert();
+    outlineCam.matrixWorld.fromArray(view.transform.matrix);
+    outlineCam.matrixWorldInverse.copy(outlineCam.matrixWorld).invert();
+    const bg = scene.background, fog = scene.fog; scene.background = null; scene.fog = null;
+    for (const ch of world.children) ch.visible = !!ch.userData.outline;
+    renderer.render(scene, outlineCam);
+    for (const ch of world.children) ch.visible = !ch.userData.outline;
+    scene.background = bg; scene.fog = fog;
   }
 
   let lastT = 0, frames = 0;
-  setInterval(() => { const st = document.getElementById('status'); if (mode === 'cal' && frames === 0) st.textContent = 'AR не присылает кадры… (0 кадров)'; }, 3000);
+  setInterval(() => { if (mode === 'cal' && frames === 0) statusEl.textContent = 'AR не присылает кадры… (0 кадров)'; }, 3000);
   session.requestAnimationFrame(function onFrame(t, frame) {
     session.requestAnimationFrame(onFrame);
     const dt = lastT ? (t - lastT) / 1000 : 0; lastT = t;
     const pose = frame.getViewerPose(local);
-    frames++; if (frames % 30 === 0) document.getElementById('hint').dataset.f = frames;
+    if (pose) lastPose = pose;
+    frames++;
+    if (real.length === 2) followAnchors(frame);
     if (mode === 'cal') {
       const hits = frame.getHitTestResults(hitSrc);
       if (hits.length) {
+        lastHitResult = hits[0];
         const p = hits[0].getPose(local).transform.position;
-        lastHit = new THREE.Vector3(p.x, p.y, p.z);
+        hitBuf.push(new THREE.Vector3(p.x, p.y, p.z)); if (hitBuf.length > 20) hitBuf.shift();
         statusEl.textContent = '✅ Пол найден';
-      } else { lastHit = null; statusEl.textContent = 'Ищу пол… медленно води телефоном'; }
-      // прозрачный кадр — видна камера
+        if (wantMark) doMark(hits[0]);
+      } else { if (wantMark) { wantMark = false; statusEl.textContent = 'Пол не найден — поводи телефоном'; } lastHitResult = null; hitBuf.length = 0; statusEl.textContent = 'Ищу пол… медленно води телефоном'; }
       target.viewport.set(0, 0, layer.framebufferWidth, layer.framebufferHeight); target.scissorTest = false;
       renderer.setRenderTarget(target);
       renderer.setClearColor(0x000000, 0); renderer.clear();
       return;
     }
+    if (mode === 'adjust') { if (pose) renderOutline(pose); return; }
     if (mode === 'count') {
       countdown -= dt;
       statusEl.textContent = `Мир появится через ${Math.max(0, Math.ceil(countdown))}…`;
@@ -449,8 +564,8 @@ async function startAR() {
     if (frames % 15 === 0) {
       const p = pose.transform.position;
       document.getElementById('diag').textContent =
-        `v7 | кадр ${frames} | рисунков ${renderer.info.render.calls} | GL ${gl.getError()} | потерян ${gl.isContextLost()} | ` +
-        `голова ${p.x.toFixed(1)},${p.y.toFixed(1)},${p.z.toFixed(1)} | мир ${world.position.x.toFixed(1)},${world.position.y.toFixed(1)},${world.position.z.toFixed(1)} | экран ${layer.framebufferWidth}x${layer.framebufferHeight}`;
+        `v8 | кадр ${frames} | рисунков ${renderer.info.render.calls} | якоря ${anchors.filter(Boolean).length} | ` +
+        `голова ${p.x.toFixed(1)},${p.y.toFixed(1)},${p.z.toFixed(1)}`;
     }
   });
   session.addEventListener('end', () => location.reload());
