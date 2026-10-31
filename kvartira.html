@@ -11,7 +11,9 @@
   button { font-size: 20px; padding: 14px 26px; border: 0; border-radius: 14px; background: #3c3; color: #000; font-weight: bold; }
   button.grey { background: #444; color: #fff; }
   #err { color: #f66; max-width: 460px; }
-  #overlay { position: fixed; inset: 0; display: none; pointer-events: none; }
+  #overlay { position: fixed; inset: 0; display: block; pointer-events: none; z-index: 10; }
+  #panel, #cross { display: none; }
+  .ar #panel, .ar #cross { display: block; }
   #overlay * { pointer-events: auto; }
   #cross { position: absolute; left: 50%; top: 50%; width: 60px; height: 60px; transform: translate(-50%, -50%); pointer-events: none; }
   #cross::before, #cross::after { content: ""; position: absolute; background: #ff0; box-shadow: 0 0 3px #000; }
@@ -25,6 +27,7 @@
 <body>
 <div id="menu">
   <div style="font-size:28px;font-weight:bold">🏰 Квартира-замок</div>
+  <div style="color:#888">версия 5</div>
   <div style="max-width:460px">Твоя квартира превратится в замок из блоков.<br>
   Сначала держи телефон <b>в руке</b> и отметь два угла на полу.<br>Потом вставь телефон в очки.</div>
   <button id="startAR">Старт (AR)</button>
@@ -32,8 +35,10 @@
   <div id="err"></div>
 </div>
 
-<div id="dbg" style="position:fixed;left:0;right:0;top:0;z-index:99;background:rgba(150,0,0,.9);color:#fff;font-size:14px;padding:6px;display:none;white-space:pre-wrap"></div>
 <div id="overlay">
+  <div id="dbg" style="position:fixed;left:0;right:0;top:0;z-index:99;background:rgba(150,0,0,.9);color:#fff;font-size:14px;padding:6px;display:none;white-space:pre-wrap"></div>
+
+  <div id="diag" style="position:absolute;left:8px;bottom:8px;font-size:13px;color:#ff0;text-shadow:0 0 3px #000;pointer-events:none"></div>
   <div id="cross"></div>
   <div id="panel">
     <div id="step" style="font-weight:bold;font-size:18px"></div>
@@ -281,6 +286,7 @@ function startPreview() {
   }
   requestAnimationFrame(loop);
 }
+window.__test = { THREE, renderer, renderStereo, headM, world };
 window.__preview = (x, z, y) => { previewPos.set(x, 1.6, z); yaw = y; };
 
 // ================== AR РЕЖИМ (телефон + очки) ==================
@@ -300,7 +306,7 @@ async function startAR() {
     });
   } catch (e) { err.textContent = 'Не удалось включить AR: ' + e.message; return; }
 
-  overlay.style.display = 'block';
+  overlay.classList.add('ar');
   document.getElementById('menu').style.display = 'none';
   if (!session.domOverlayState) showErr('Кнопки поверх камеры не поддерживаются в этом браузере');
   const gl = renderer.getContext();
@@ -349,11 +355,13 @@ async function startAR() {
     statusEl.textContent = `Разница с планом: ${Math.round(Math.abs(dReal - dPlan) * 100)} см`;
   }
 
-  let lastT = 0;
+  let lastT = 0, frames = 0;
+  setInterval(() => { const st = document.getElementById('status'); if (mode === 'cal' && frames === 0) st.textContent = 'AR не присылает кадры… (0 кадров)'; }, 3000);
   session.requestAnimationFrame(function onFrame(t, frame) {
     session.requestAnimationFrame(onFrame);
     const dt = lastT ? (t - lastT) / 1000 : 0; lastT = t;
     const pose = frame.getViewerPose(local);
+    frames++; if (frames % 30 === 0) document.getElementById('hint').dataset.f = frames;
     if (mode === 'cal') {
       const hits = frame.getHitTestResults(hitSrc);
       if (hits.length) {
@@ -370,14 +378,21 @@ async function startAR() {
     if (mode === 'count') {
       countdown -= dt;
       statusEl.textContent = `Мир появится через ${Math.max(0, Math.ceil(countdown))}…`;
-      if (countdown <= 0) { mode = 'world'; overlay.style.display = 'none'; }
+      if (countdown <= 0) { mode = 'world'; overlay.classList.remove('ar'); } // корень оверлея не прячем, иначе экран чёрный
       target.viewport.set(0, 0, layer.framebufferWidth, layer.framebufferHeight); target.scissorTest = false;
       renderer.setRenderTarget(target); renderer.setClearColor(0x000000, 0); renderer.clear();
       return;
     }
     if (!pose) return;
     headM.fromArray(pose.transform.matrix);
+    renderer.info.autoReset = false; renderer.info.reset();
     renderStereo(target, layer.framebufferWidth, layer.framebufferHeight);
+    if (frames % 15 === 0) {
+      const p = pose.transform.position;
+      document.getElementById('diag').textContent =
+        `v5 | кадр ${frames} | рисунков ${renderer.info.render.calls} | GL ${gl.getError()} | потерян ${gl.isContextLost()} | ` +
+        `голова ${p.x.toFixed(1)},${p.y.toFixed(1)},${p.z.toFixed(1)} | мир ${world.position.x.toFixed(1)},${world.position.y.toFixed(1)},${world.position.z.toFixed(1)} | экран ${layer.framebufferWidth}x${layer.framebufferHeight}`;
+    }
   });
   session.addEventListener('end', () => location.reload());
 }
